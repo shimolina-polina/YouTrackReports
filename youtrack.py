@@ -21,8 +21,13 @@ async def login(update: Update, context: CallbackContext) -> None:
     login = context.args[0]
     password = context.args[1]
     try:
-        response = requests.get('https://youtrack.{{BASE_PATH}}.com/api/users/me', auth=HTTPBasicAuth(login, password))
+        response = requests.get('https://youtrack.advalange.com/api/users/me', auth=HTTPBasicAuth(login, password))
         response.raise_for_status()
+        user_data = response.json()
+    
+        user_id = user_data.get('id')
+
+        context.user_data['id'] = user_id
         context.user_data['login'] = login
         context.user_data['password'] = password
         await update.message.reply_text('Спасибо за авторизацию!')
@@ -38,17 +43,24 @@ async def login(update: Update, context: CallbackContext) -> None:
 
 
 async def generate_document(update: Update, context: CallbackContext) -> None:
-    base_url = f'https://youtrack.{{BASE_PATH}}.com/api/issues'
+    base_url = f"https://youtrack.advalange.com/api/workItems"
 
-    fields = 'idReadable,project(name),summary'
-    query = '(for:%20me) or (Reviewer:%20me)'
-    top = 40
-    skip = 0
-
-    max_retries = 5
-    retry_delay = 2
+    try:
+        start_date = datetime.strptime(context.args[0], '%Y-%m-%d').date().isoformat()  # Формат YYYY-MM-DD
+        end_date = datetime.strptime(context.args[1], '%Y-%m-%d').date().isoformat()    # Формат YYYY-MM-DD
+    except (ValueError, IndexError):
+        await update.message.reply_text('Неверный формат даты. Используйте формат: YYYY-MM-DD YYYY-MM-DD')
+        return
+    id = context.user_data.get('id')
     login = context.user_data.get('login')
     password = context.user_data.get('password')
+    params = {
+            "$top": 1000,
+            "fields": "duration(minutes),issue(summary,project(name))",
+            "endDate": end_date,
+            "startDate": start_date,
+            "creator": id
+        }
 
     if login == None or password == None:
         await update.message.reply_text('Пожалуйста, авторизуйтесь.')
@@ -58,101 +70,42 @@ async def generate_document(update: Update, context: CallbackContext) -> None:
         await update.message.reply_text('Пожалуйста, укажите начальную и конечную даты в формате: YYYY-MM-DD YYYY-MM-DD')
         return
     
-    try:
-        start_date = datetime.strptime(context.args[0], '%Y-%m-%d')
-        end_date = datetime.strptime(context.args[1], '%Y-%m-%d')
-    except ValueError:
-        await update.message.reply_text('Неверный формат даты. Используйте формат: YYYY-MM-DD')
-        return
-
     issueDictionary = {}
 
-    while True:
-        url = f'{base_url}?fields={fields}&query={query}&$skip={skip}&$top={top}'
-        
-        try:
-            response = requests.get(url, auth=HTTPBasicAuth(login, password))
-            response.raise_for_status()
+    try:
+        response = requests.get(base_url, params=params, auth=HTTPBasicAuth(login, password))
 
-            issues = response.json()
-            
-            if not issues:
-                break
+        print(f"Response status code: {response.status_code}")
+        print(f"Response text: {response.text}")
+        response.raise_for_status()
 
-            for issue in issues:
-                issue_id = issue.get('idReadable')
-                time_tracking_url = f'https://youtrack.{{BASE_PATH}}.com/api/issues/{issue_id}/timeTracking?fields=workItems(author(login),date,duration(minutes))'
-                retries = 0
-                while retries < max_retries:
-                    try:
-                        response = requests.get(time_tracking_url, auth=HTTPBasicAuth(login, password))
-                        response.raise_for_status()
+        work_items = response.json()
 
-                        timeTrackingData = response.json()
+        if not work_items:
+            await update.message.reply_text('Нет задач за указанный период.')
+            return
 
-                        if 'workItems' in timeTrackingData:
-                            for work_item in timeTrackingData['workItems']:
-                                author_login = work_item.get('author', {}).get('login')
-                                work_item_date = work_item.get('date')
-                                duration_minutes = work_item.get('duration', {}).get('minutes')
+        for work_item in work_items:
+            project_name = work_item.get('issue', {}).get('project', {}).get('name')
+            issue_summary = work_item.get('issue', {}).get('summary')
+            duration_minutes = work_item.get('duration', {}).get('minutes', 0)
 
-                                if (
-                                    author_login == 'Polina.Shimolina' 
-                                    and work_item_date is not None 
-                                    and start_date <= datetime.utcfromtimestamp(work_item_date / 1000.0) <= end_date
-                                ):
-                                    
-                                    project_name = issue.get('project', {}).get('name')
+            if project_name not in issueDictionary:
+                issueDictionary[project_name] = {}
 
-                                    if project_name not in issueDictionary:
-                                        issueDictionary[project_name] = []
+            if issue_summary in issueDictionary[project_name]:
+                issueDictionary[project_name][issue_summary] += duration_minutes
+            else:
+                issueDictionary[project_name][issue_summary] = duration_minutes
 
-                                    task_exists = False
-                                    for task in issueDictionary[project_name]:
-                                        if task['summary'] == issue.get('summary'):
-                                            task['spent_hours'] += duration_minutes
-                                            task_exists = True
-                                            break
-                                    
-                                    if not task_exists:
-                                        issueDictionary[project_name].append({
-                                            'summary': issue.get('summary'),
-                                            'spent_hours': duration_minutes
-                                        })
-                        break
+        hours_sum = sum(sum(issues.values()) for issues in issueDictionary.values()) / 60
 
-                    except requests.exceptions.HTTPError as http_err:
-                        print(f'HTTP error occurred for issue {issue_id}: {http_err}')
-                        retries += 1
-                        time.sleep(retry_delay)
-                    except Exception as err:
-                        print(f'Other error occurred for issue {issue_id}: {err}')
-                        retries += 1
-                        time.sleep(retry_delay)
-            skip += top
+        print(issueDictionary)
 
-        except requests.exceptions.HTTPError as http_err:
-            print(f'HTTP error occurred while getting issues list: {http_err}')
-            break
-        except Exception as err:
-            print(f'Other error occurred while getting issues list: {err}')
-            break
+        print(hours_sum)
 
-
-    hours_sum = 0
-
-    for project, issues in issueDictionary.items():
-        for issue in issues:
-
-            issue['spent_hours'] = math.ceil(issue['spent_hours']/60)
-            hours_sum += issue['spent_hours']
-
-
-
-    print(issueDictionary)
-
-    print(hours_sum)
-
+    except requests.exceptions.RequestException as e:
+        await update.message.reply_text(f'Ошибка при выполнении запроса: {e}')
     doc = Document()
 
     if issueDictionary:
@@ -167,16 +120,16 @@ async def generate_document(update: Update, context: CallbackContext) -> None:
         row_number = 1
 
         for project, issues in issueDictionary.items():
-            for issue in issues:
+            for issue, duration_minutes in issues.items():
                 row_cells = table.add_row().cells
                 row_cells[0].text = str(row_number)
-                row_cells[1].text = '[A661ver12A] ' + issue['summary']
-                row_cells[2].text = str(issue['spent_hours'])
+                row_cells[1].text = f"[{project}] {issue}"
+                row_cells[2].text = f"{duration_minutes / 60}"
 
                 row_number += 1
         row_cells = table.add_row().cells
         row_cells[1].text = 'Всего:'
-        row_cells[2].text = str(hours_sum)
+        row_cells[2].text = f"{hours_sum}"
 
     document_path = 'issue_dictionary.docx'
     doc.save(document_path)
